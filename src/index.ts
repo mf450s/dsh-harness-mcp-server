@@ -16,6 +16,9 @@
  * 启动时对存量未分组会话补挂一次(存量捞回)。
  *
  * 回路: Hermes 记忆 →(context)→ task_inbox → Harness agent 执行 → 结果进队列 → task_result → Hermes 持久化
+ *
+ * 审批(MCP-only): 本插件自有会话的 approval/request 由本插件 deterministic 裁决(缺省 rejected, 永不等待 UI);
+ * 非本插件拥有的会话原样交回链路, 浏览器 UI 的 ask 行为不变。
  */
 
 // ── Context 声明合并: 让 ctx.tools / ctx.llm / ctx.agents 有类型 ──
@@ -68,6 +71,21 @@ export interface Config {
   authToken?: string
   /** cwd 白名单(设置后 agent 只能在列出的目录下干活) */
   workspaceRoots?: string[]
+  /** 审批允许名单: 只作用于本插件自有的 agent 会话(见 apply 里的 approval/request 监听); 缺省为空 = 一律 deterministic rejected */
+  approvalAllowlist?: ApprovalAllowlistEntry[]
+}
+
+/**
+ * approval 允许名单条目(只作用于本插件自有会话, 即两张表里的会话)。
+ * 审批请求载荷只有 agent 身份 + toolName(+ 可选 callId/reason), 不带命令/路径字段, 所以匹配只能落在这两项上:
+ * root 按工作区根前缀比对该会话的 cwd(缺省 = 不限定工作区), toolName 精确匹配请求的工具名(缺省 = 不限定);
+ * 两项都缺省的条目 = 该会话的任何审批都 allowed-once。
+ */
+export interface ApprovalAllowlistEntry {
+  /** 工作区根(沿用 workspaceRoots 的 resolve 前缀比对); 缺省 = 不限定 */
+  root?: string
+  /** 审批请求的工具名, 精确匹配; 缺省 = 不限定 */
+  toolName?: string
 }
 
 /** 运行时配置(apply 时从 config 初始化, 提供安全默认值) */
@@ -81,6 +99,8 @@ const runtimeConfig = {
   maxAgents: 8,
   authToken: '',
   workspaceRoots: [] as string[],
+  // 缺省空名单 = 本插件自有会话的审批一律 deterministic rejected(不给任何自动批准)
+  approvalAllowlist: [] as ApprovalAllowlistEntry[],
 }
 
 /** 工具回调统一返回 MCP text content */
@@ -145,6 +165,37 @@ const sessionToCwd = new Map<string, string>()
 
 /** 每个 cwd 的串行执行锁(防同一 agent 会话被并发 followup 冲突) */
 const agentLocks = new Map<string, Promise<unknown>>()
+
+/**
+ * 本插件自有会话判定: 只认自己的两张表(liveAgents / sessionToCwd = 本插件 create 出来的会话)。
+ * 从 UI 那边 ctx.agents.get 接管过来的会话不在表里, 不算本插件拥有 → 审批交回 next()(浏览器 UI 保持 ask)。
+ */
+function isPluginOwnedSession(sessionId: string): boolean {
+  if (sessionToCwd.has(sessionId)) return true
+  for (const rec of liveAgents.values()) if (String(rec.sessionId) === sessionId) return true
+  return false
+}
+
+/**
+ * 审批允许名单匹配(按会话 cwd 所属工作区根 + 请求 toolName), 命中才 allowed-once。
+ * 请求载荷不带命令/路径字段, 所以只能用 agent 身份(查自己的表拿 cwd)和 toolName 这两项匹配。
+ * 缺省名单为空 → 没有任何自动批准; 命中项的 root/toolName 缺省 = 该维度不限定。
+ */
+function matchApprovalAllowlist(sessionId: string, toolName: string): ApprovalAllowlistEntry | undefined {
+  if (runtimeConfig.approvalAllowlist.length === 0) return undefined
+  const cwd = sessionToCwd.get(sessionId)
+  for (const entry of runtimeConfig.approvalAllowlist) {
+    // root 限定沿用 workspaceRoots 的 resolve 前缀比对(表里的 cwd 已是 realpath 规范化值)
+    if (entry.root !== undefined) {
+      if (cwd === undefined) continue
+      const root = resolve(entry.root)
+      if (cwd !== root && !cwd.startsWith(root + '/')) continue
+    }
+    if (entry.toolName !== undefined && entry.toolName !== toolName) continue
+    return entry
+  }
+  return undefined
+}
 
 /** getAgent 的返回: handle 恒有 .agent; resume 出来的独占句柄带 disposeAfter 标记, 任务结束后应 flush+dispose */
 interface ResolvedAgent {
@@ -659,11 +710,26 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   if (config.maxAgents !== undefined) runtimeConfig.maxAgents = config.maxAgents
   if (config.authToken) runtimeConfig.authToken = config.authToken
   if (config.workspaceRoots) runtimeConfig.workspaceRoots = config.workspaceRoots
+  if (config.approvalAllowlist) runtimeConfig.approvalAllowlist = config.approvalAllowlist
 
   const port = config.port ?? 8090
   // 安全默认: 仅监听本机。暴露公网/局域网前必须自行加认证+反代+TLS(见 README 警告)
   const host = config.host ?? '127.0.0.1'
   console.log('[harness-mcp-server] apply called, port=', port)
+
+  // MCP-only 审批抑制: 只挂本插件自己的 ctx —— cordis 的 scope 过滤只会把本插件 scope 里
+  // agent(= 本插件 create/resume 出来的会话)的 approval/request 送进来, 别的 scope 的会话不会。
+  // 裁决本身只认两张表(= 本插件 create 出来的池会话); 经 resume 接管但不带表的会话走 passthrough。
+  // 不改 sandbox 设置、权限预设、approval policy 默认值, 也不动 CLI / shell 提权检查。
+  ctx.on('approval/request', async (request, next) => {
+    // passthrough: 非本插件拥有的 agent(例如浏览器 UI 手开的会话)原样交回链路, UI 的 ask 行为不变。
+    const sessionId = String(request.agent.id)
+    if (!isPluginOwnedSession(sessionId)) return next()
+    // allowlist: 命中(工作区根 + toolName)才 allowed-once; 缺省名单为空 = 任何请求都不会自动批准。
+    if (matchApprovalAllowlist(sessionId, request.toolName) !== undefined) return 'allowed-once'
+    // deterministic default(非交互 worker 契约): fail closed = rejected, 永不交互, 永不等待 UI。
+    return 'rejected'
+  })
 
   const servers = new Map<string, McpServer>()
   const transports = new Map<string, StreamableHTTPServerTransport>()

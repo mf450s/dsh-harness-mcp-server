@@ -47,6 +47,20 @@ export interface Config {
     authToken?: string;
     /** cwd 白名单(设置后 agent 只能在列出的目录下干活) */
     workspaceRoots?: string[];
+    /** 审批允许名单: 只作用于本插件自有的 agent 会话(见 apply 里的 approval/request 监听); 缺省为空 = 一律 deterministic rejected */
+    approvalAllowlist?: ApprovalAllowlistEntry[];
+}
+/**
+ * approval 允许名单条目(只作用于本插件自有会话, 即两张表里的会话)。
+ * 审批请求载荷只有 agent 身份 + toolName(+ 可选 callId/reason), 不带命令/路径字段, 所以匹配只能落在这两项上:
+ * root 按工作区根前缀比对该会话的 cwd(缺省 = 不限定工作区), toolName 精确匹配请求的工具名(缺省 = 不限定);
+ * 两项都缺省的条目 = 该会话的任何审批都 allowed-once。
+ */
+export interface ApprovalAllowlistEntry {
+    /** 工作区根(沿用 workspaceRoots 的 resolve 前缀比对); 缺省 = 不限定 */
+    root?: string;
+    /** 审批请求的工具名, 精确匹配; 缺省 = 不限定 */
+    toolName?: string;
 }
 /**
  * 插件入口: 启动 MCP server(StreamableHTTP, 跨网), 通过 ctx 桥接 Harness 能力。

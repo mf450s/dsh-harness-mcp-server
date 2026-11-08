@@ -3,6 +3,7 @@
 //   1. 任意会话续接: live 接管 / 持久化 resume / 明确报错(三级)
 //   2. realpath 规范化: create 的 meta.cwd 为 realpath 值; 目录不存在时回退 resolve 不阻断
 //   3. attach_session 工具 + 启动存量捞回(workspaceRegistry/sessions/sessionPersistence 三服务路径)
+//   4. 审批抑制: 本插件自有会话 deterministic(缺省 rejected / 允许名单 allowed-once), 非本插件拥有的会话走 next() 交回 UI
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
@@ -49,6 +50,29 @@ const fakePersistence = {
   list: async () => [{ version: 0, id: 'sess-persisted', createdAt: 1, cwd: FAKE_CWD }],
 }
 
+// ── 审批抑制脚手架 ──
+// apply() 在插件自己的 ctx 上注册 approval/request 监听(cordis waterfall: listener(request, next))。
+// 这里按 waterfall 姿势派发: 监听器返回裁决 = 本插件裁决; 监听器调用 next() = 交回链路其余部分
+// (浏览器 UI 的 answerer)。模拟 UI 永远挂着直到手动 settle, 于是"是否等待 UI"可被直接测出。
+const approvalListeners = []
+function makeUiChain(initialOutcome) {
+  const state = { consulted: false }
+  let settle
+  const promise = new Promise((resolve) => { settle = resolve })
+  if (initialOutcome) setTimeout(() => settle(initialOutcome), 30)
+  return { next: () => { state.consulted = true; return promise }, settle, state }
+}
+// 50ms 内结算 = 没有等待 UI(模拟 UI 不会自行出结果)
+// 注意: runtimeConfig 是模块级共享状态, 第二个实例配置允许名单后会覆盖第一个实例的视图,
+// 所以"缺省配置(空名单)"的两项必须排在第二次 apply() 之前。
+async function dispatchApproval(index, request, ui) {
+  const outcome = await Promise.race([
+    Promise.resolve(approvalListeners[index](request, ui.next)),
+    new Promise((resolve) => setTimeout(() => resolve('PENDING'), 50)),
+  ])
+  return { outcome, consultedUi: ui.state.consulted }
+}
+
 const ctx = {
   tools: { keys: () => [] },
   llm: {},
@@ -71,6 +95,8 @@ const ctx = {
   sessionPersistence: fakePersistence,
   workspaceRegistry: wsRegistry,
   effect: (fn) => { disposer = fn(); return disposer },
+  // approval/request 监听器捕获口(审批抑制测试用): 记录 apply() 注册的 waterfall listener
+  on: (name, listener) => { if (name === 'approval/request') approvalListeners.push(listener); return () => {} },
   get: (name) => (name === 'workspaceRegistry' ? wsRegistry
     : name === 'sessions' ? fakeSessions
     : name === 'sessionPersistence' ? fakePersistence
@@ -79,6 +105,7 @@ const ctx = {
 let disposer = () => {}
 
 const PORT = 8099
+const PORT2 = 8095 // 第二个 apply() 实例(允许名单配置)用的端口: 与 8099 错开, 且本机未被占用
 const BASE = `http://127.0.0.1:${PORT}/mcp`
 
 async function rpc(sessionId, body) {
@@ -169,6 +196,25 @@ try {
   await new Promise((r) => setTimeout(r, 500))
   checks['存量捞回: live 列表会话补挂'] = attachedIds.includes('sess-live2')
   checks['存量捞回: 持久化会话补挂'] = attachedIds.includes('sess-persisted')
+
+  // ── 审批抑制(MCP-only): 本插件自有会话 deterministic 裁决, 非本插件拥有的会话交回 UI ──
+  // 本插件池里 create 出来的会话(在 liveAgents/sessionToCwd 两张表里) + 缺省允许名单(空) → deterministic rejected
+  const ownedSessionId = String(created[0].id)
+  const dDefault = await dispatchApproval(0, { agent: { id: ownedSessionId }, toolName: 'bash' }, makeUiChain())
+  checks['审批: 本插件自有会话 + 空允许名单 → deterministic rejected(不询问 UI)'] = dDefault.outcome === 'rejected' && dDefault.consultedUi === false
+
+  // 非本插件拥有的会话(经 ctx.agents.get 从 UI 接管, 不在两张表里) → 原样 next(), UI 的 ask 行为不变
+  const uiChain = makeUiChain('allowed-once')
+  const dPassthrough = await dispatchApproval(0, { agent: { id: 'sess-live' }, toolName: 'bash' }, uiChain)
+  checks['审批: 非本插件拥有的会话 → 走 next() 交回 UI(透传其裁决)'] = dPassthrough.outcome === 'allowed-once' && dPassthrough.consultedUi === true
+
+  // 允许名单(第二实例, 独立端口): 命中(工作区根 + toolName) → allowed-once; 不命中 → 仍 deterministic rejected
+  await apply(ctx, { port: PORT2, host: '127.0.0.1', approvalAllowlist: [{ root: FAKE_CWD, toolName: 'bash' }] })
+  await new Promise((r) => setTimeout(r, 200))
+  const dAllow = await dispatchApproval(1, { agent: { id: ownedSessionId }, toolName: 'bash' }, makeUiChain())
+  checks['审批: 命中允许名单(工作区根 + toolName) → allowed-once'] = dAllow.outcome === 'allowed-once' && dAllow.consultedUi === false
+  const dDeny = await dispatchApproval(1, { agent: { id: ownedSessionId }, toolName: 'web_fetch' }, makeUiChain())
+  checks['审批: 允许名单不匹配(toolName) → 仍 deterministic rejected'] = dDeny.outcome === 'rejected' && dDeny.consultedUi === false
 
   const failed = Object.entries(checks).filter(([, ok]) => !ok)
   for (const [name, ok] of Object.entries(checks)) console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}`)
