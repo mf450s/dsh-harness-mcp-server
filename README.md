@@ -104,6 +104,8 @@ printf 'n\nY\n' | hermes mcp add harness_plugin --url http://127.0.0.1:8090/mcp
         host: 127.0.0.1        # 默认仅本机; 暴露前必须加认证
         # authToken: 'your-secret-token'     # 可选: Bearer token 认证
         # workspaceRoots: ['/workspace']      # 可选: cwd 白名单
+        # approvalAllowlist:                  # 可选: approval allowlist (plugin-owned sessions only; empty default = deterministic rejected)
+        #   - { root: '/workspace', toolName: 'bash' }
 ```
 
 ## Positioning
@@ -113,6 +115,7 @@ This is best used as a **fallback tool**, not a daily driver: for everyday code 
 - The agent session is **reused per cwd** (avoids re-loading project context on every call — roughly 15–20× cheaper than one-shot `dsh headless`).
 - Bash runs sandboxed (`workspace-write`): install `bubblewrap` on the host, or the sandbox will refuse write commands.
 - Each new MCP session gets its own `McpServer` + transport (an MCP `McpServer` connects to a single transport).
+- Approval suppression is MCP-only: an `approval/request` for a session this plugin created is decided deterministically (default `rejected`, allowlist entries grant `allowed-once`) and never waits for a UI. Any other (browser-owned) agent falls through to `next()` unchanged, so the web UI keeps its interactive `ask` behavior. Sandbox settings, permission presets and approval policy defaults are untouched.
 
 ## License
 

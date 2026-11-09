@@ -106,6 +106,8 @@ printf 'n\nY\n' | hermes mcp add harness_plugin --url http://127.0.0.1:8090/mcp
         host: 127.0.0.1        # 默认仅本机; 暴露前必须加认证
         # authToken: 'your-secret-token'     # 可选: Bearer token 认证
         # workspaceRoots: ['/workspace']      # 可选: cwd 白名单
+        # approvalAllowlist:                  # 可选: 审批允许名单(只作用于本插件自有会话; 缺省空 = deterministic rejected)
+        #   - { root: '/workspace', toolName: 'bash' }
 ```
 
 ## 定位
@@ -115,6 +117,7 @@ printf 'n\nY\n' | hermes mcp add harness_plugin --url http://127.0.0.1:8090/mcp
 - agent 会话**按 cwd 复用**（避免每次调用都重新加载项目上下文——比一次性 `dsh headless` 省约 15–20 倍）。
 - bash 走沙箱（`workspace-write`）：请在宿主机安装 `bubblewrap`，否则沙箱会拒绝写命令。
 - 每个新的 MCP 会话拥有独立的 `McpServer` + transport（一个 MCP `McpServer` 只能连接一个 transport）。
+- 审批抑制是 MCP-only 的：本插件自己 create 出来的会话，其 `approval/request` 由本插件 deterministic 裁决（缺省 `rejected`，命中允许名单才 `allowed-once`），永不等待 UI；其他（浏览器拥有的）会话原样走 `next()`，Web UI 的交互式 `ask` 行为不变。sandbox 设置、权限预设、approval policy 默认值都没动。
 
 ## License
 
